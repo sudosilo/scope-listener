@@ -1187,14 +1187,32 @@ function opPlaying(){
   if(yt.player&&yt.player.getPlayerState&&yt.player.getPlayerState()===1) return 'yt';
   return null;
 }
+/* A seek stalls playback while the player rebuffers, and the room keeps moving during the stall,
+   so a plain +0.5 lands behind where it should. Each bump aims ahead by the learned stall time,
+   then checks two seconds later how far off it landed and refines that learned time.
+   Rapid taps stack on the intended position instead of the not-yet-updated player clock. */
+var bumpState={pending:null,lag:{yt:0.6,file:0.03},seq:0};
 function opBump(d){
-  var src=opPlaying();
+  var src=opPlaying()||(bumpState.pending&&bumpState.pending.src);
   if(!src){ $('#ctlStatus').textContent='Nothing playing to bump.'; return; }
   st.chopping=false; ol.localLock=true;
-  if(src==='file'){ mediaEl.currentTime=Math.max(mediaEl.currentTime+d,0); }
-  else { yt.player.seekTo(Math.max(yt.player.getCurrentTime()+d,0),true); }
+  var now=performance.now(),p=bumpState.pending,base;
+  if(p&&p.src===src&&now-p.at<2500) base=p.ideal+(now-p.at)/1000;
+  else base=(src==='file')?mediaEl.currentTime:yt.player.getCurrentTime();
+  var ideal=Math.max(base+d,0),lag=bumpState.lag[src],id=++bumpState.seq;
+  bumpState.pending={src:src,ideal:ideal,at:now,id:id};
+  if(src==='file') mediaEl.currentTime=ideal+lag; else yt.player.seekTo(ideal+lag,true);
   resetSync();
   $('#ctlStatus').textContent='Bumped '+(d>0?'+':'')+d+'s';
+  setTimeout(function(){
+    var q=bumpState.pending; if(!q||q.id!==id) return;
+    var playing=(src==='file')?(mediaEl&&!mediaEl.paused):(yt.player.getPlayerState&&yt.player.getPlayerState()===1);
+    if(!playing) return;
+    var actual=(src==='file')?mediaEl.currentTime:yt.player.getCurrentTime();
+    var expected=q.ideal+(performance.now()-q.at)/1000,deficit=expected-actual;
+    if(Math.abs(deficit)<3) bumpState.lag[src]=Math.max(0,Math.min(2,bumpState.lag[src]+0.5*deficit));
+    $('#ctlStatus').textContent='Bumped '+(d>0?'+':'')+d+'s, landed '+(deficit>0?'behind ':'ahead ')+Math.round(Math.abs(deficit)*1000)+' ms, seek lag now '+Math.round(bumpState.lag[src]*1000)+' ms';
+  },2000);
 }
 $('#opMinus').addEventListener('click',function(){ opBump(-0.5); });
 $('#opPlus').addEventListener('click',function(){ opBump(0.5); });
