@@ -92,6 +92,8 @@ body.menu .scrim{opacity:1;pointer-events:auto}
 .ib:focus-visible{outline:3px solid #7aa7c7;outline-offset:2px}
 .k .ib,.ctl label .ib,.scale .ib{width:18px;height:18px;font-size:11px;margin-left:4px}
 .cwrap{position:relative}
+.ibwrap{position:relative;display:block}
+.ib.side{position:absolute;top:50%;right:6px;transform:translateY(-50%);z-index:2}
 .ib.corner{position:absolute;top:8px;right:8px;margin:0}
 .pop{position:fixed;z-index:40;max-width:min(280px,calc(100vw - 16px));background:var(--panel);color:var(--ink);border:1px solid var(--term);border-radius:4px;padding:9px 11px;font:12px/1.5 var(--num);box-shadow:0 4px 16px rgba(30,60,40,.16)}
 .pop:before{content:"> ";color:var(--term);font-weight:700}
@@ -156,7 +158,7 @@ body.menu .scrim{opacity:1;pointer-events:auto}
   </script>
 
   <div id="olHero">
-    <button type="button" id="olToggleBtn">&#9679;&nbsp; Auto-sync from Offset Listener</button>
+    <button type="button" id="olToggleBtn">&#9679;&nbsp; Listen (Offset Listener)</button>
   </div>
 
   <div class="bezel">
@@ -210,7 +212,7 @@ body.menu .scrim{opacity:1;pointer-events:auto}
 
   <div class="card" id="ytCard">
     <div class="ch"><span class="dot" style="background:var(--c2)"></span>YouTube, heard through the mic</div>
-    <div class="fname" id="olStatus" style="white-space:normal">Uses your rough location to find whatever song Offset Listener has synced nearby, and keeps this video locked to it automatically.</div>
+    <div class="fname" id="olStatus" style="white-space:normal">Listens with the microphone to identify a song, the same way Offset Listener does, then keeps this video locked to it automatically afterward.</div>
     <hr class="sep">
     <div class="row" style="margin-top:10px">
       <input class="txt" id="ytUrl" type="url" inputmode="url" placeholder="Paste a YouTube link" autocomplete="off">
@@ -1118,7 +1120,7 @@ function olPoll(){
     .then(function(anchor){
       ol.failCount = 0;
       if(!anchor || anchor.error || !anchor.videoId || typeof anchor.epochMs !== 'number') {
-        if(!ol.lastKey) olStatus('Watching for a synced song nearby, none active yet.');
+        if(!ol.lastKey && !ol.listening) olStatus('Watching for a synced song nearby, none active yet.');
         return;
       }
       var key = anchor.videoId + '|' + Math.round(anchor.epochMs);
@@ -1163,21 +1165,69 @@ function olPoll(){
       }
     });
 }
+function olListenOnce(){
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    olStatus('This browser has no microphone support.');
+    return;
+  }
+  ol.listening = true;
+  olStatus('Requesting microphone...');
+  navigator.mediaDevices.getUserMedia({ audio: true }).then(function(stream){
+    var chunks = [];
+    var capturedAt = Date.now();
+    var mimeType = (window.MediaRecorder && MediaRecorder.isTypeSupported('audio/webm')) ? 'audio/webm' : '';
+    var recorder = new MediaRecorder(stream, mimeType ? { mimeType: mimeType } : undefined);
+    recorder.ondataavailable = function(e){ if(e.data.size > 0) chunks.push(e.data); };
+    recorder.onstop = function(){
+      stream.getTracks().forEach(function(t){ t.stop(); });
+      olStatus('Identifying...');
+      var blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+      var form = new FormData();
+      form.append('audio', blob, 'clip.webm');
+      form.append('capturedAt', String(capturedAt));
+      form.append('clipDurationMs', '9000');
+      if(ol.loc){ form.append('lat', String(ol.loc.lat)); form.append('lng', String(ol.loc.lng)); }
+      fetch(OL_BASE + '/api/recognize', { method: 'POST', body: form })
+        .then(function(r){
+          if(!r.ok) throw new Error('status ' + r.status);
+          return r.json();
+        })
+        .then(function(data){
+          ol.listening = false;
+          if(data.error || !data.title){
+            olStatus((data.error || 'No match found') + '. Still watching for a synced song nearby...');
+            return;
+          }
+          olStatus('Identified: ' + data.title + (data.artist ? ' \u2014 ' + data.artist : '') + '. Loading and syncing...');
+        })
+        .catch(function(err){
+          ol.listening = false;
+          olStatus('Identify request failed (' + (err && err.message ? err.message : 'network or CORS block') + ').');
+        });
+    };
+    recorder.start();
+    olStatus('Listening...');
+    setTimeout(function(){ recorder.stop(); }, 9000);
+  }).catch(function(){
+    ol.listening = false;
+    olStatus('Microphone permission denied or unavailable.');
+  });
+}
 function olStart(){
   ol.enabled = true;
-  $('#olToggleBtn').textContent = '\u25CF\u00a0\u00a0Stop auto-sync';
+  $('#olToggleBtn').textContent = '\u25CF\u00a0\u00a0Stop';
   $('#olToggleBtn').classList.add('on');
   olStatus('Getting location...');
   olGetLocation().then(function(loc){
     if(!loc){
       olStatus('Location needed for this, allow it and tap again.');
       ol.enabled = false;
-      $('#olToggleBtn').textContent = '\u25CF\u00a0\u00a0Auto-sync from Offset Listener';
+      $('#olToggleBtn').textContent = '\u25CF\u00a0\u00a0Listen (Offset Listener)';
       $('#olToggleBtn').classList.remove('on');
       return;
     }
     ol.loc = loc;
-    olStatus('Watching for a synced song nearby...');
+    olListenOnce();
     olPoll();
     ol.pollTimer = setInterval(olPoll, 2000);
   });
@@ -1186,9 +1236,9 @@ function olStop(){
   ol.enabled = false;
   if(ol.pollTimer) clearInterval(ol.pollTimer);
   ol.lastKey = null;
-  $('#olToggleBtn').textContent = '\u25CF\u00a0\u00a0Auto-sync from Offset Listener';
+  $('#olToggleBtn').textContent = '\u25CF\u00a0\u00a0Listen (Offset Listener)';
   $('#olToggleBtn').classList.remove('on');
-  olStatus('Auto-sync stopped.');
+  olStatus('Stopped.');
 }
 $('#olToggleBtn').addEventListener('click', function(){
   if(ol.enabled) olStop(); else olStart();
@@ -1291,7 +1341,7 @@ var INFO={
   level:'Scales the mic trace to the same size as the file trace so the shapes are easy to compare.',
   freeze:'Stops the display so one moment can be studied.',
   calibrate:'Plays a few clicks through the speaker and times how long the mic takes to hear them. That round trip is the phone built in delay. Needs the mic on and the volume up.',
-  olsync:'Asks Offset Listener what song is currently synced near this phone and loads that exact video at the exact position it should be at right now, then keeps correcting it if it drifts. Turn the mic on afterward to see how well the real sync actually holds up on the scope.',
+  olsync:'Records nine seconds from the microphone and asks Offset Listener to identify the song, exactly like tapping Listen there does. Once identified, that video loads at the correct position and stays locked to it, correcting for drift automatically. Turn the mic on afterward to see how well the real sync actually holds up on the scope.',
   yt:'Plays a YouTube video inside the page. Browsers keep YouTube audio sealed off from page code, so the scope hears it the way it hears a second device, out the speaker and into the mic on channel 2. Load the same song as a file on channel 1 with its speaker off to compare the two.',
   ytplay:'Starts or pauses the video.',
   ytmatch:'Jumps the video to the same spot as the song on channel 1. Then let the offset settle and tap Align now to trim out what is left.',
@@ -1331,7 +1381,10 @@ function addIB(sel,k,where,ownerSel){
     var w=document.createElement('div'); w.className='cwrap';
     el.parentNode.insertBefore(w,el); w.appendChild(el); b.classList.add('corner'); w.appendChild(b);
   }
-  else el.parentNode.insertBefore(b,el.nextSibling);
+  else {
+    var w2=document.createElement('span'); w2.className='ibwrap';
+    el.parentNode.insertBefore(w2,el); w2.appendChild(el); b.classList.add('side'); w2.appendChild(b);
+  }
 }
 [
   ['#burger','burger'],['.brand','cursor'],['#lamp','lamp'],
