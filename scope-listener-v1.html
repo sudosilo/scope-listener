@@ -75,6 +75,8 @@ input[type=range]{width:100%;accent-color:var(--term)}
 .hint{font-size:13px;color:var(--muted);margin:14px 4px 0;max-width:62ch}
 .hint:before{content:"# ";color:var(--term)}
 .scrim{position:fixed;inset:0;background:rgba(30,60,40,.12);opacity:0;pointer-events:none;transition:opacity .2s;z-index:20}
+.about-scrim{position:fixed;inset:0;display:flex;align-items:flex-start;justify-content:center;padding:30px 16px;overflow-y:auto;background:rgba(20,30,22,.55);z-index:60}
+.about-scrim[hidden]{display:none!important}
 .drawer{position:fixed;top:0;left:0;bottom:0;width:min(90vw,390px);background:rgba(252,253,251,.72);-webkit-backdrop-filter:blur(10px) saturate(1.2);backdrop-filter:blur(10px) saturate(1.2);border-right:1px solid var(--line);transform:translateX(-102%);transition:transform .22s ease;z-index:21;overflow-y:auto;padding:calc(env(safe-area-inset-top,0px) + 12px) 14px calc(env(safe-area-inset-bottom,0px) + 24px);box-shadow:4px 0 18px rgba(30,60,40,.12)}
 body.menu .drawer{transform:none}
 body.menu .scrim{opacity:1;pointer-events:auto}
@@ -129,7 +131,7 @@ body.menu .scrim{opacity:1;pointer-events:auto}
     <button class="btn small" id="aboutBtn" aria-label="About this app" style="margin-left:8px">i</button>
   </div>
 
-  <div class="scrim" id="aboutScrim" hidden style="display:flex;align-items:flex-start;justify-content:center;padding:30px 16px;overflow-y:auto;opacity:1;pointer-events:auto;background:rgba(20,30,22,.55);z-index:50">
+  <div class="about-scrim" id="aboutScrim" hidden>
     <div class="card" style="max-width:460px;width:100%;text-align:left;position:relative;margin-top:0">
       <button id="aboutCloseBtn" aria-label="Close" style="position:absolute;top:10px;right:10px;border:none;background:none;font-size:1.2rem;color:var(--muted);cursor:pointer">&times;</button>
       <div style="background:var(--screen);border:1px solid var(--line);border-radius:4px;padding:10px 12px;font-size:12px;color:var(--muted);margin-bottom:12px"># still being worked on, some of this is proven and some is not, see below</div>
@@ -1109,8 +1111,12 @@ function olComputePosition(anchor){
 function olPoll(){
   if(!ol.enabled || !ol.loc) return;
   fetch(OL_BASE + '/api/anchor?lat=' + ol.loc.lat + '&lng=' + ol.loc.lng, { cache: 'no-store' })
-    .then(function(r){ return r.json(); })
+    .then(function(r){
+      if(!r.ok) throw new Error('Offset Listener responded with status ' + r.status);
+      return r.json();
+    })
     .then(function(anchor){
+      ol.failCount = 0;
       if(!anchor || anchor.error || !anchor.videoId || typeof anchor.epochMs !== 'number') {
         if(!ol.lastKey) olStatus('Watching for a synced song nearby, none active yet.');
         return;
@@ -1150,7 +1156,12 @@ function olPoll(){
         olStatus('Synced to ' + (anchor.title || 'unknown title') + '. Turn the mic on to compare.');
       });
     })
-    .catch(function(){});
+    .catch(function(err){
+      ol.failCount = (ol.failCount || 0) + 1;
+      if(ol.failCount >= 2){
+        olStatus('Cannot reach Offset Listener (' + (err && err.message ? err.message : 'network or CORS block') + '). Still retrying.');
+      }
+    });
 }
 function olStart(){
   ol.enabled = true;
