@@ -207,6 +207,7 @@ body.menu .scrim{opacity:1;pointer-events:auto}
     <div class="row" style="margin-top:10px">
       <button class="btn two" id="micBtn">Mic on</button>
     </div>
+    <select id="micPick" style="margin-top:8px;max-width:100%"><option value="">default mic</option></select>
     <div class="fname" id="micName">Mic off</div>
   </div>
 
@@ -500,6 +501,15 @@ function rebuildAt(rate){
   if(fileURL) attachFile(fileURL,fileName,t,playing);
 }
 
+function fillMicPick(){
+  if(!navigator.mediaDevices||!navigator.mediaDevices.enumerateDevices) return;
+  navigator.mediaDevices.enumerateDevices().then(function(list){
+    var sel=$('#micPick'),keep=sel.value,ins=list.filter(function(d){return d.kind==='audioinput';});
+    sel.innerHTML='<option value="">default mic</option>'+ins.map(function(d,i){return '<option value="'+d.deviceId+'">'+(d.label||('mic '+(i+1)))+'</option>';}).join('');
+    sel.value=keep;
+    if(ins.length<=1) $('#micName').textContent+=' (this phone exposes one mic to the browser)';
+  });
+}
 function stopMic(){
   if(micStream) micStream.getTracks().forEach(function(tr){tr.stop();});
   if(micSrc){try{micSrc.disconnect();}catch(err){}}
@@ -510,7 +520,10 @@ function toggleMic(){
   if(micStream){ stopMic(); resetSync(); return; }
   if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){ $('#micName').textContent='Mic needs a secure https page'; return; }
   if(!ctx) ensureCtx();
-  navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}}).then(function(stream){
+  var pick=$('#micPick').value, want={echoCancellation:false,noiseSuppression:false,autoGainControl:false};
+  if(pick) want.deviceId={exact:pick};
+  navigator.mediaDevices.getUserMedia({audio:want}).then(function(stream){
+    fillMicPick();
     micStream=stream;
     var tr=stream.getAudioTracks()[0];
     try{ micSrc=ctx.createMediaStreamSource(stream); }
@@ -1049,6 +1062,7 @@ var seekEl=$('#seek');
 seekEl.addEventListener('input',function(){ seeking=true; if(mediaEl&&mediaEl.duration) mediaEl.currentTime=this.value/1000*mediaEl.duration; });
 seekEl.addEventListener('change',function(){ seeking=false; resetSync(); updateSyncUI(); });
 $('#micBtn').addEventListener('click',toggleMic);
+$('#micPick').addEventListener('change',function(){ if(micStream){ stopMic(); toggleMic(); } });
 
 $('#modes').addEventListener('click',function(e){
   var b=e.target.closest('.chip'); if(!b) return;
@@ -1098,6 +1112,7 @@ function holdRelease(e){
   var to=Math.max(h.t+h.shift,0);
   if(h.src==='file'){ mediaEl.currentTime=to; mediaEl.play(); }
   else { yt.player.seekTo(to,true); yt.player.playVideo(); }
+  ol.localLock=true;
   $('#resS').textContent='released at '+(h.shift>=0?'+':'')+h.shift.toFixed(2)+'s';
   resetSync();
 }
@@ -1125,16 +1140,19 @@ function onsetStack(){
 function chopSay(t){ $('#resS').textContent=t; if(typeof olStatus==='function') olStatus(t); }
 async function ytChopAlign(){
   if(st.chopping) return;
+  if(yt.player&&yt.player.getPlayerState&&yt.player.getPlayerState()===0){ chopSay('Song finished, nothing to align.'); return; }
   if(!yt.player||!yt.player.getCurrentTime||!yt.player.seekTo){ chopSay('Load a YouTube song first, playing out loud.'); return; }
   if(!micStream){ toggleMic(); await chopWait(1200); }
   if(!micStream){ chopSay('Mic needed for align.'); return; }
   st.chopping=true;
   var measure=async function(){ await chopWait(5500); return onsetStack(); };
   chopSay('Align: measuring the starting point...');
-  var best=await measure(), moves=0, steps=[0.5,0.25,0.1], si, dir, improved, k, d;
+  var fine=!!ol.fineOnly, steps=fine?[0.1,0.05]:[0.5,0.25,0.1,0.05], margin=fine?1.06:1.03, cap=fine?6:18;
+  var best=await measure(), moves=0, si, dir, improved, k, d;
   for(si=0;si<steps.length&&st.chopping;si++){
     dir=0; improved=true;
-    while(improved&&moves<16&&st.chopping){
+    while(improved&&moves<cap&&st.chopping){
+      if(yt.player.getPlayerState&&yt.player.getPlayerState()===0){ st.chopping=false; break; }
       improved=false;
       var dirs=dir?[dir]:[1,-1];
       for(k=0;k<dirs.length;k++){
@@ -1142,16 +1160,17 @@ async function ytChopAlign(){
         yt.player.seekTo(yt.player.getCurrentTime()+d*steps[si],true); moves++;
         chopSay('Align: chopped '+(d>0?'+':'-')+steps[si]+'s, listening...');
         var m=await measure();
-        if(m>best*1.03){ best=m; dir=d; improved=true; break; }
+        if(m>best*margin){ best=m; dir=d; improved=true; break; }
         yt.player.seekTo(yt.player.getCurrentTime()-d*steps[si],true);
       }
     }
   }
   st.chopping=false;
-  chopSay('Align finished after '+moves+' chop'+(moves===1?'':'s')+'.');
+  ol.localLock=true; ol.fineOnly=true;
+  chopSay((fine?'Fine check':'Align')+' finished after '+moves+' chop'+(moves===1?'':'s')+'. Next passes use small bites only.');
 }
 async function ytTrackLoop(){
-  while(st.track&&!(mediaEl&&!mediaEl.paused)){
+  while(st.track&&!ol.songDone&&!(mediaEl&&!mediaEl.paused)){
     await ytChopAlign();
     await chopWait(20000);
   }
@@ -1225,14 +1244,18 @@ function olPoll(){
       }
       var key = anchor.videoId + '|' + Math.round(anchor.epochMs);
       if(key === ol.lastKey){
-        if(yt.player && yt.player.getCurrentTime){
+        if(ol.localLock || ol.songDone) return;
+        if(yt.player && yt.player.getCurrentTime && yt.player.getPlayerState){
           var target = olComputePosition(anchor);
+          var dur = yt.player.getDuration ? yt.player.getDuration() : 0;
+          if(yt.player.getPlayerState() === 0 || (dur > 0 && target >= dur - 1)){ ol.songDone = true; st.track = false; st.chopping = false; togglePressed($('#trackBtn'), false); olStatus('Song finished. Tap Listen for the next one.'); return; }
           var actual = yt.player.getCurrentTime();
           if(typeof actual === 'number' && Math.abs(actual - target) > 1.5) yt.player.seekTo(target, true);
         }
         return;
       }
-      ol.lastKey = key;
+      if(anchor.videoDurationSeconds && olComputePosition(anchor) >= anchor.videoDurationSeconds - 1){ ol.lastKey = key; return; }
+      ol.lastKey = key; ol.localLock = false; ol.songDone = false; ol.fineOnly = false;
       if(fileURL && mediaEl){ olFileSync(anchor); return; }
       if(!micStream) toggleMic();
       var startAt = Math.max(olComputePosition(anchor), 0);
