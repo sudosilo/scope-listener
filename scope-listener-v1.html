@@ -1133,8 +1133,10 @@ function olPoll(){
         return;
       }
       ol.lastKey = key;
+      if(fileURL && mediaEl){ olFileSync(anchor); return; }
+      if(!micStream) toggleMic();
       var startAt = Math.max(olComputePosition(anchor), 0);
-      olStatus('Offset Listener: ' + (anchor.title || 'unknown title') + ', loading and syncing...');
+      olStatus('Offset Listener: ' + (anchor.title || 'unknown title') + ', loading and syncing. YouTube audio is sealed off from page code, so internal sync before playing out loud needs this song loaded as a file on channel 1.');
       loadYtApi(function(){
         $('#ytBox').hidden = false;
         if(yt.player && yt.player.cueVideoById){
@@ -1232,9 +1234,53 @@ function olStart(){
     ol.pollTimer = setInterval(olPoll, 2000);
   });
 }
+/* Internal sync: play channel 1 silently at the anchor's position, compare against the mic,
+   correct until locked, then turn the speaker on. */
+function olSetSpeaker(on){
+  st.speaker=on;
+  var b=$('#spkBtn'); togglePressed(b,on); b.textContent=on?'Speaker on':'Speaker off';
+  if(outGain) outGain.gain.setValueAtTime(on?1:0,ctx.currentTime);
+}
+function olFileSync(anchor){
+  if(ol.syncTimer) clearInterval(ol.syncTimer);
+  olSetSpeaker(false);
+  setOffset(0);
+  mediaEl.currentTime = Math.max(olComputePosition(anchor), 0);
+  var p = mediaEl.play(); if(p && p.catch) p.catch(function(){ olStatus('Tap Play on channel 1 once, the browser blocked silent playback.'); });
+  if(!micStream) toggleMic();
+  resetSync();
+  var title = anchor.title || 'the song';
+  var started = Date.now(), lastFix = Date.now(), prev = null, fixes = 0;
+  olStatus('Syncing ' + title + ' internally, speaker muted while the mic compares...');
+  ol.syncTimer = setInterval(function(){
+    if(!ol.enabled || !mediaEl){ clearInterval(ol.syncTimer); return; }
+    if(Date.now() - started > 45000){
+      clearInterval(ol.syncTimer);
+      olStatus('Could not lock onto ' + title + ' within 45s. Speaker left muted, check that the same song is loaded on channel 1 and the room audio reaches the mic.');
+      return;
+    }
+    if(Date.now() - lastFix < 1500) return;
+    if(sync.res === null || sync.natural === null || sync.resR < 0.3){ prev = null; return; }
+    var rt = (cal.latency !== null) ? cal.latency / 1000 : 0;
+    var err = sync.natural - rt;
+    if(prev === null || Math.abs(err - prev) > 0.05){ prev = err; return; }
+    prev = null;
+    if(Math.abs(err) < 0.04){
+      clearInterval(ol.syncTimer);
+      olSetSpeaker(true);
+      olStatus('Locked to ' + title + ' within ' + Math.round(Math.abs(err) * 1000) + ' ms after ' + fixes + ' correction' + (fixes === 1 ? '' : 's') + '. Playing out loud.');
+      return;
+    }
+    mediaEl.currentTime = Math.max(mediaEl.currentTime - err, 0);
+    setOffset(0); resetSync();
+    fixes++; lastFix = Date.now();
+    olStatus('Correction ' + fixes + ': moved ' + (err > 0 ? 'back ' : 'forward ') + Math.round(Math.abs(err) * 1000) + ' ms, checking again...');
+  }, 500);
+}
 function olStop(){
   ol.enabled = false;
   if(ol.pollTimer) clearInterval(ol.pollTimer);
+  if(ol.syncTimer) clearInterval(ol.syncTimer);
   ol.lastKey = null;
   $('#olToggleBtn').textContent = '\u25CF\u00a0\u00a0Listen (Offset Listener)';
   $('#olToggleBtn').classList.remove('on');
