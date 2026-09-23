@@ -386,8 +386,9 @@ function runSync(){
     }
   }
   if(sync.resR>=0.25) sync.natural=sync.res+st.offsetMs/1000;
-  if(st.track&&sync.resR>=(sync.fine?0.2:0.3)&&Math.abs(sync.res)>0.0015){
-    setOffset(sync.natural*1000);
+  if(st.track&&sync.resR>=(sync.fine?0.2:0.3)&&mediaEl&&!mediaEl.paused){
+    var rtT=(cal.latency!==null)?cal.latency/1000:0, errT=sync.natural-rtT;
+    if(Math.abs(errT)>0.03&&performance.now()-(st.lastMove||0)>2500){ fileMove(errT); }
   }
 }
 
@@ -996,7 +997,7 @@ function updateSyncUI(){
   if(cal.busy) return;
   var offV=$('#offV'),offS=$('#offS'),resV=$('#resV'),resS=$('#resS'),matV=$('#matV'),matS=$('#matS');
   var net=cal.use&&cal.latency!==null;
-  if(sync.natural===null){offV.textContent='--'; offS.textContent=ctx?'listening':'waiting';}
+  if(sync.natural===null){offV.textContent='--'; offS.textContent=!ctx?'waiting':((!mediaEl||mediaEl.paused)?'ch1 silent, align uses echo':'listening');}
   else{var nm=shownOffset(sync.natural); offV.textContent=fmtMs(nm); offS.textContent=(Math.abs(nm)<0.5?'together':(nm>0?'mic late':'mic early'))+(net?', net':'');}
   if(sync.res===null){
     resV.textContent='--'; resS.textContent=ctx?('gathering '+Math.round(sync.progress*100)+'%'):'\u00a0';
@@ -1064,12 +1065,72 @@ offEl.addEventListener('change',function(){ st.offsetMs=+this.value; applyOffset
 Array.prototype.forEach.call(document.querySelectorAll('[data-nudge]'),function(b){
   b.addEventListener('click',function(){ setOffset(st.offsetMs+parseFloat(b.getAttribute('data-nudge'))); });
 });
-$('#zeroBtn').addEventListener('click',function(){ setOffset(0); });
+/* Moves channel 1 playback itself, not just the comparison trim, so the correction is audible. */
+function fileMove(err){
+  mediaEl.currentTime=Math.max(mediaEl.currentTime-err,0);
+  st.lastMove=performance.now();
+  setOffset(0); resetSync();
+  $('#resS').textContent='moved '+(err>0?'back ':'forward ')+Math.round(Math.abs(err)*1000)+' ms';
+}
+
+/* YouTube path: its audio is sealed from page code, so the mic hears the phone's own copy and the
+   room copy together. When they are apart every onset lands twice; when they line up onsets stack.
+   This chops the video in steps and keeps whichever position makes the onsets stack tightest. */
+function chopWait(ms){ return new Promise(function(r){ setTimeout(r,ms); }); }
+function onsetStack(){
+  var M=Math.round(envRate*4),x=new Float32Array(M),i,sum=0,sq=0;
+  lastN(envB,envW,ENV_LEN,M,x);
+  for(i=0;i<M;i++){ sum+=x[i]; sq+=x[i]*x[i]; }
+  return sum>0?M*sq/(sum*sum):0;
+}
+function chopSay(t){ $('#resS').textContent=t; if(typeof olStatus==='function') olStatus(t); }
+async function ytChopAlign(){
+  if(st.chopping) return;
+  if(!yt.player||!yt.player.getCurrentTime||!yt.player.seekTo){ chopSay('Load a YouTube song first, playing out loud.'); return; }
+  if(!micStream){ toggleMic(); await chopWait(1200); }
+  if(!micStream){ chopSay('Mic needed for align.'); return; }
+  st.chopping=true;
+  var measure=async function(){ await chopWait(5500); return onsetStack(); };
+  chopSay('Align: measuring the starting point...');
+  var best=await measure(), moves=0, steps=[0.5,0.25,0.1], si, dir, improved, k, d;
+  for(si=0;si<steps.length&&st.chopping;si++){
+    dir=0; improved=true;
+    while(improved&&moves<16&&st.chopping){
+      improved=false;
+      var dirs=dir?[dir]:[1,-1];
+      for(k=0;k<dirs.length;k++){
+        d=dirs[k];
+        yt.player.seekTo(yt.player.getCurrentTime()+d*steps[si],true); moves++;
+        chopSay('Align: chopped '+(d>0?'+':'-')+steps[si]+'s, listening...');
+        var m=await measure();
+        if(m>best*1.03){ best=m; dir=d; improved=true; break; }
+        yt.player.seekTo(yt.player.getCurrentTime()-d*steps[si],true);
+      }
+    }
+  }
+  st.chopping=false;
+  chopSay('Align finished after '+moves+' chop'+(moves===1?'':'s')+'.');
+}
+async function ytTrackLoop(){
+  while(st.track&&!(mediaEl&&!mediaEl.paused)){
+    await ytChopAlign();
+    await chopWait(20000);
+  }
+}
+
+$('#zeroBtn').addEventListener('click',function(){ st.chopping=false; setOffset(0); $('#resS').textContent='trim reset'; });
 $('#alignBtn').addEventListener('click',function(){
-  if(sync.natural!==null&&sync.res!==null&&sync.resR>=0.25){ setOffset(sync.natural*1000); }
-  else{ $('#resS').textContent='need more signal'; }
+  if(mediaEl&&!mediaEl.paused){
+    if(sync.natural!==null&&sync.res!==null&&sync.resR>=0.25){
+      var rt=(cal.latency!==null)?cal.latency/1000:0; fileMove(sync.natural-rt);
+    } else { $('#resS').textContent='need more signal'; }
+  } else { ytChopAlign(); }
 });
-$('#trackBtn').addEventListener('click',function(){ st.track=!st.track; togglePressed(this,st.track); });
+$('#trackBtn').addEventListener('click',function(){
+  st.track=!st.track; togglePressed(this,st.track);
+  if(!st.track) st.chopping=false;
+  else if(!(mediaEl&&!mediaEl.paused)) ytTrackLoop();
+});
 
 var calUseBtn=$('#calUseBtn');
 togglePressed(calUseBtn,cal.use); calText();
