@@ -92,6 +92,9 @@ body.menu .scrim{opacity:1;pointer-events:auto}
 .ib:focus-visible{outline:3px solid #7aa7c7;outline-offset:2px}
 .k .ib,.ctl label .ib,.scale .ib{width:18px;height:18px;font-size:11px;margin-left:4px}
 .cwrap{position:relative}
+.oprow{display:grid;grid-template-columns:1fr 1.4fr 1fr;gap:8px;margin-top:6px}
+.oprow .btn{width:100%;margin:0}
+.ytframe{height:1px!important;aspect-ratio:auto!important;opacity:0;border:0!important;margin:0!important}
 .ibwrap{position:relative;display:block}
 .ib.side{position:absolute;top:50%;right:6px;transform:translateY(-50%);z-index:2}
 .ib.corner{position:absolute;top:8px;right:8px;margin:0}
@@ -177,18 +180,21 @@ body.menu .scrim{opacity:1;pointer-events:auto}
   </div>
 
   <div class="card">
-    <div class="sync">
+    <div class="sync" hidden>
       <div><div class="k">Offset</div><div class="v" id="offV">--</div><div class="sub" id="offS">waiting</div></div>
       <div><div class="k">Residual</div><div class="v" id="resV">--</div><div class="sub" id="resS">&nbsp;</div></div>
       <div><div class="k">Match</div><div class="v" id="matV">--</div><div class="sub" id="matS">&nbsp;</div></div>
     </div>
-    <div class="meter"><div class="needle" id="needle"></div></div>
-    <div class="scale"><span>-50 ms</span><span>mic early | mic late</span><span>+50 ms</span></div>
-    <div class="row" style="margin-top:14px">
-      <button class="btn go" id="alignBtn">Align now</button>
+    <div class="meter" hidden><div class="needle" id="needle"></div></div>
+    <div class="scale" hidden><span>-50 ms</span><span>mic early | mic late</span><span>+50 ms</span></div>
+    <button id="alignBtn" hidden></button><button id="zeroBtn" hidden></button>
+    <div class="oprow">
+      <button class="btn" id="opMinus">- 0.5s</button>
       <button class="btn" id="trackBtn" aria-pressed="false">Auto track</button>
-      <button class="btn" id="zeroBtn">Reset trim</button>
+      <button class="btn" id="opPlus">+ 0.5s</button>
     </div>
+    <button class="btn go" id="opPause" style="display:block;width:100%;margin-top:10px">Pause</button>
+    <div class="fname" id="ctlStatus" style="white-space:normal;min-height:1.4em">&nbsp;</div>
   </div>
 
   <div class="card">
@@ -1113,7 +1119,7 @@ function holdRelease(e){
   if(h.src==='file'){ mediaEl.currentTime=to; mediaEl.play(); }
   else { yt.player.seekTo(to,true); yt.player.playVideo(); }
   ol.localLock=true;
-  $('#resS').textContent='released at '+(h.shift>=0?'+':'')+h.shift.toFixed(2)+'s';
+  $('#ctlStatus').textContent='released at '+(h.shift>=0?'+':'')+h.shift.toFixed(2)+'s';
   resetSync();
 }
 cv.addEventListener('pointerup',holdRelease);
@@ -1124,7 +1130,7 @@ function fileMove(err){
   mediaEl.currentTime=Math.max(mediaEl.currentTime-err,0);
   st.lastMove=performance.now();
   setOffset(0); resetSync();
-  $('#resS').textContent='moved '+(err>0?'back ':'forward ')+Math.round(Math.abs(err)*1000)+' ms';
+  $('#ctlStatus').textContent='moved '+(err>0?'back ':'forward ')+Math.round(Math.abs(err)*1000)+' ms';
 }
 
 /* YouTube path: its audio is sealed from page code, so the mic hears the phone's own copy and the
@@ -1137,7 +1143,7 @@ function onsetStack(){
   for(i=0;i<M;i++){ sum+=x[i]; sq+=x[i]*x[i]; }
   return sum>0?M*sq/(sum*sum):0;
 }
-function chopSay(t){ $('#resS').textContent=t; if(typeof olStatus==='function') olStatus(t); }
+function chopSay(t){ $('#ctlStatus').textContent=t; if(typeof olStatus==='function') olStatus(t); }
 async function ytChopAlign(){
   if(st.chopping) return;
   if(yt.player&&yt.player.getPlayerState&&yt.player.getPlayerState()===0){ chopSay('Song finished, nothing to align.'); return; }
@@ -1176,7 +1182,38 @@ async function ytTrackLoop(){
   }
 }
 
-$('#zeroBtn').addEventListener('click',function(){ st.chopping=false; setOffset(0); $('#resS').textContent='trim reset'; });
+function opPlaying(){
+  if(mediaEl&&!mediaEl.paused) return 'file';
+  if(yt.player&&yt.player.getPlayerState&&yt.player.getPlayerState()===1) return 'yt';
+  return null;
+}
+function opBump(d){
+  var src=opPlaying();
+  if(!src){ $('#ctlStatus').textContent='Nothing playing to bump.'; return; }
+  st.chopping=false; ol.localLock=true;
+  if(src==='file'){ mediaEl.currentTime=Math.max(mediaEl.currentTime+d,0); }
+  else { yt.player.seekTo(Math.max(yt.player.getCurrentTime()+d,0),true); }
+  resetSync();
+  $('#ctlStatus').textContent='Bumped '+(d>0?'+':'')+d+'s';
+}
+$('#opMinus').addEventListener('click',function(){ opBump(-0.5); });
+$('#opPlus').addEventListener('click',function(){ opBump(0.5); });
+$('#opPause').addEventListener('click',function(){
+  var b=this;
+  if(st.opPaused){
+    if(st.opPaused==='file'&&mediaEl) mediaEl.play(); else if(yt.player&&yt.player.playVideo) yt.player.playVideo();
+    st.opPaused=null; b.textContent='Pause';
+    $('#ctlStatus').textContent='Resumed. Held time became the offset.';
+    resetSync(); return;
+  }
+  var src=opPlaying();
+  if(!src){ $('#ctlStatus').textContent='Nothing playing to pause.'; return; }
+  st.chopping=false; ol.localLock=true;
+  if(src==='file') mediaEl.pause(); else yt.player.pauseVideo();
+  st.opPaused=src; b.textContent='Play';
+  $('#ctlStatus').textContent='Paused. Tap Play on the beat.';
+});
+$('#zeroBtn').addEventListener('click',function(){ st.chopping=false; setOffset(0); $('#ctlStatus').textContent='trim reset'; });
 $('#alignBtn').addEventListener('click',function(){
   if(mediaEl&&!mediaEl.paused){
     if(sync.natural!==null&&sync.res!==null&&sync.resR>=0.25){
@@ -1563,7 +1600,7 @@ function addIB(sel,k,where,ownerSel){
   ['.chip[data-mode="radial"]','radial'],['.chip[data-mode="corr"]','corr'],
   ['.sync > div:nth-child(1) .k','offset','in'],['.sync > div:nth-child(2) .k','residual','in'],['.sync > div:nth-child(3) .k','match','in'],
   ['.scale span:nth-child(2)','meter','in','.meter'],
-  ['#alignBtn','align'],['#trackBtn','track'],['#zeroBtn','zero'],
+  
   ['label[for="file"]','load'],['#playBtn','play'],['#spkBtn','speaker'],['#loopBtn','loop'],['#time','seek','after','.seek'],['#micBtn','mic'],
   ['label[for="offset"]','trim','in'],['[data-nudge="10"]','nudge','after','#drawer .row'],
   ['label[for="tb"]','timebase','in'],['label[for="g1"]','gain1','in'],['label[for="g2"]','gain2','in'],['label[for="pers"]','glow','in'],
