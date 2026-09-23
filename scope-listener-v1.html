@@ -34,7 +34,7 @@ body.beat.lit .brand:after{opacity:1}
 .lamp.on{color:var(--ok);font-weight:700}
 .lamp.on i{background:var(--ok);box-shadow:0 0 0 3px rgba(43,138,62,.18)}
 .bezel{background:var(--bezel);border:1px solid #c3ccc5;border-radius:10px;padding:8px}
-canvas#scope{display:block;width:100%;aspect-ratio:4/3;border-radius:4px;background:var(--screen);border:1px solid #b9c5bc;touch-action:manipulation}
+canvas#scope{display:block;width:100%;aspect-ratio:4/3;border-radius:4px;background:var(--screen);border:1px solid #b9c5bc;touch-action:none}
 canvas#plot{display:block;width:100%;aspect-ratio:3/1;margin-top:8px;border-radius:4px;background:#fbfcf6;border:1px solid #b9c5bc}
 .modes{display:flex;gap:6px;overflow-x:auto;padding:8px 2px 2px;scrollbar-width:none}
 .modes::-webkit-scrollbar{display:none}
@@ -983,6 +983,11 @@ function frame(ts){
     foot='Correlation  peak marks the lag';
   }
   if(st.freeze) foot+='  frozen';
+  if(!mediaEl||mediaEl.paused){
+    lines.push(['ch1 empty: YouTube audio is sealed from the page',COL.c1]);
+    lines.push(['load the song file on ch1 to see both channels',COL.c1]);
+  }
+  if(holdState) lines.push(['HOLD '+(holdState.shift>=0?'+':'')+holdState.shift.toFixed(2)+'s, release to play',COL.c4]);
   readout(lines,foot);
   if(ctx&&!cal.busy&&ts-sync.lastRun>600){ sync.lastRun=ts; runSync(); runBpm(); updateSyncUI(); pushPlot(now); }
   tickCursor(now);
@@ -1065,6 +1070,40 @@ offEl.addEventListener('change',function(){ st.offsetMs=+this.value; applyOffset
 Array.prototype.forEach.call(document.querySelectorAll('[data-nudge]'),function(b){
   b.addEventListener('click',function(){ setOffset(st.offsetMs+parseFloat(b.getAttribute('data-nudge'))); });
 });
+/* Press and hold the scope: pauses the playing source (ch1 file, else the YouTube video).
+   Drag left or right while holding to shift it, full screen width is 2 seconds.
+   Release to resume. The held time itself also counts, same as the pause trick in Offset Listener. */
+var holdState=null;
+function holdSource(){
+  if(mediaEl&&!mediaEl.paused) return 'file';
+  if(yt.player&&yt.player.getPlayerState&&yt.player.getPlayerState()===1) return 'yt';
+  return null;
+}
+cv.addEventListener('pointerdown',function(e){
+  var src=holdSource(); if(!src) return;
+  st.chopping=false;
+  var t=src==='file'?mediaEl.currentTime:yt.player.getCurrentTime();
+  if(src==='file') mediaEl.pause(); else yt.player.pauseVideo();
+  holdState={src:src,t:t,x:e.clientX,shift:0,id:e.pointerId};
+  try{ cv.setPointerCapture(e.pointerId); }catch(err){}
+  e.preventDefault();
+});
+cv.addEventListener('pointermove',function(e){
+  if(!holdState||e.pointerId!==holdState.id) return;
+  holdState.shift=(e.clientX-holdState.x)/Math.max(1,cv.clientWidth)*2;
+});
+function holdRelease(e){
+  if(!holdState||(e&&e.pointerId!==holdState.id)) return;
+  var h=holdState; holdState=null;
+  var to=Math.max(h.t+h.shift,0);
+  if(h.src==='file'){ mediaEl.currentTime=to; mediaEl.play(); }
+  else { yt.player.seekTo(to,true); yt.player.playVideo(); }
+  $('#resS').textContent='released at '+(h.shift>=0?'+':'')+h.shift.toFixed(2)+'s';
+  resetSync();
+}
+cv.addEventListener('pointerup',holdRelease);
+cv.addEventListener('pointercancel',holdRelease);
+
 /* Moves channel 1 playback itself, not just the comparison trim, so the correction is audible. */
 function fileMove(err){
   mediaEl.currentTime=Math.max(mediaEl.currentTime-err,0);
