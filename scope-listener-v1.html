@@ -102,15 +102,15 @@ body.menu .scrim{opacity:1;pointer-events:auto}
 .ytframe iframe{position:absolute;inset:0;width:100%;height:100%;border:0}
 [hidden]{display:none!important}
 #olHero{max-width:880px;margin:0 auto 14px;padding:0 12px}
-#olToggleBtn{
+#olToggleBtn,#apToggleBtn{
   display:block;width:100%;appearance:none;border:2px solid #0f4f7a;border-radius:8px;
   background:linear-gradient(180deg,#1f8fd6,#136fae);color:#fff;
   font:800 16px/1.3 var(--num);text-transform:none;letter-spacing:.2px;
   padding:16px 14px;cursor:pointer;box-shadow:0 3px 0 #0c4a72,0 6px 14px rgba(19,111,174,.35);
   transition:transform .08s ease;
 }
-#olToggleBtn:active{transform:translateY(2px);box-shadow:0 1px 0 #0c4a72,0 3px 8px rgba(19,111,174,.35)}
-#olToggleBtn.on{
+#olToggleBtn:active,#apToggleBtn:active{transform:translateY(2px);box-shadow:0 1px 0 #0c4a72,0 3px 8px rgba(19,111,174,.35)}
+#olToggleBtn.on,#apToggleBtn.on{
   background:linear-gradient(180deg,#2fae5a,#1f8a44);border-color:#0d6a2c;
   box-shadow:0 3px 0 #0d5c26,0 0 0 4px rgba(47,174,90,.28),0 6px 18px rgba(31,138,68,.45);
   animation:olPulse 1.6s ease-in-out infinite;
@@ -119,7 +119,8 @@ body.menu .scrim{opacity:1;pointer-events:auto}
   0%,100%{box-shadow:0 3px 0 #0d5c26,0 0 0 4px rgba(47,174,90,.28),0 6px 18px rgba(31,138,68,.45)}
   50%{box-shadow:0 3px 0 #0d5c26,0 0 0 9px rgba(47,174,90,.12),0 6px 22px rgba(31,138,68,.55)}
 }
-@media (prefers-reduced-motion:reduce){#olToggleBtn.on{animation:none}}
+@media (prefers-reduced-motion:reduce){#olToggleBtn.on,#apToggleBtn.on{animation:none}}
+#apHero{max-width:880px;margin:0 auto 14px;padding:0 12px}
 </style>
 </head>
 <body>
@@ -154,6 +155,13 @@ body.menu .scrim{opacity:1;pointer-events:auto}
     scrim.addEventListener('click',function(e){ if(e.target===scrim) scrim.hidden=true; });
   })();
   </script>
+
+  <div id="apHero">
+    <button type="button" id="apToggleBtn">&#9679;&nbsp; Autopilot</button>
+    <div class="row" style="margin-top:8px"><button class="btn small" id="apAudibleBtn" aria-pressed="false">Reference silent</button></div>
+    <div class="fname" id="apStatus" style="white-space:normal">One tap and it listens, identifies, loads a reference copy, finds the spot, and keeps it locked to the room on its own, logging every step.</div>
+    <div class="fname" id="apStats"></div>
+  </div>
 
   <div id="olHero">
     <button type="button" id="olToggleBtn">&#9679;&nbsp; Auto-sync from Offset Listener</button>
@@ -1253,6 +1261,349 @@ $('#ytClose').addEventListener('click',function(){
   ytStatus('Video closed.');
 });
 
+/* Autopilot: hands free identify, reference load, locate, and continuous sample level tracking with logging */
+var AP_RING_SEC = 16, AP_ID_SEC = 9, AP_LOC_SEC = 6, AP_HOP = 0.01, AP_ZMIN = 6;
+var AP_BANDS = [
+  { name: 'lows', type: 'lowpass', f: 200 },
+  { name: 'mids', type: 'bandpass', f: 1000, q: 0.7 },
+  { name: 'highs', type: 'highpass', f: 4000 }
+];
+var ap = {
+  on: false, state: 'off', tap: null, tapSrc: null, tapSink: null,
+  ring: null, total: 0, t0c: [], t0: null, busy: false,
+  song: null, ref: null, nextIdentifyAt: 0, idGap: 30000,
+  lastLocateAt: 0, locateMisses: 0, lastCorrAt: 0, lastLogAt: 0, weakSince: 0,
+  samples: 0, corrections: 0, wake: null, audible: false, refURL: null
+};
+function apSay(t){ $('#apStatus').textContent = t; }
+function apStats(){
+  var r = sync.res !== null ? fmtMs(sync.res * 1000) : '--';
+  $('#apStats').textContent = 'state ' + ap.state + ', residual ' + r + ', match ' + Math.round((sync.resR || 0) * 100) +
+    '%, corrections ' + ap.corrections + ', samples ' + ap.samples;
+}
+function apTargetMs(){
+  if (cal.latency !== null) return { ms: cal.latency, src: 'calibrated' };
+  var est = 0;
+  try { est = ((ctx.baseLatency || 0) + (ctx.outputLatency || 0)) * 1000 * 2; } catch (e) {}
+  return { ms: est, src: 'estimated' };
+}
+function apLog(obj){
+  ap.samples++;
+  var t = apTargetMs(), lat = {};
+  try { lat = { baseLatency: ctx ? ctx.baseLatency : null, outputLatency: ctx ? ctx.outputLatency : null }; } catch (e) {}
+  var body = Object.assign({
+    source: 'scope-listener', deviceId: apDeviceId(), wall: Date.now(), sr: SR, state: ap.state,
+    title: ap.song ? ap.song.title : null, artist: ap.song ? ap.song.artist : null,
+    targetMs: +t.ms.toFixed(2), targetSrc: t.src, trimMs: st.offsetMs, audible: ap.audible,
+    ua: navigator.userAgent.slice(0, 120)
+  }, lat, obj);
+  fetch(OL_BASE + '/api/sync-samples', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).catch(function(){});
+}
+function apDeviceId(){
+  var id = null;
+  try { id = localStorage.getItem('scope.deviceId'); } catch (e) {}
+  if (!id) { id = 'scope-' + Math.random().toString(36).slice(2, 8); try { localStorage.setItem('scope.deviceId', id); } catch (e) {} }
+  return id;
+}
+
+function apOnAudio(e){
+  var d = e.inputBuffer.getChannelData(0), L = ap.ring.length, w = ap.total % L;
+  for (var i = 0; i < d.length; i++) { ap.ring[w] = d[i]; w++; if (w === L) w = 0; }
+  ap.total += d.length;
+  var at = performance.now();
+  ap.t0c.push({ at: at, c: Date.now() - ap.total / SR * 1000 });
+  while (ap.t0c.length && at - ap.t0c[0].at > 30000) ap.t0c.shift();
+  var m = Infinity; for (var j = 0; j < ap.t0c.length; j++) if (ap.t0c[j].c < m) m = ap.t0c[j].c;
+  ap.t0 = m;
+}
+function apEnsureTap(){
+  if (!ctx || !micSrc) return false;
+  if (ap.tapSrc === micSrc && ap.tap) return true;
+  try { if (ap.tap) ap.tap.disconnect(); } catch (e) {}
+  ap.tap = ctx.createScriptProcessor(4096, 1, 1);
+  ap.tapSink = ctx.createGain(); ap.tapSink.gain.value = 0;
+  micSrc.connect(ap.tap); ap.tap.connect(ap.tapSink); ap.tapSink.connect(ctx.destination);
+  ap.ring = new Float32Array(Math.round(SR * AP_RING_SEC)); ap.total = 0; ap.t0c = []; ap.t0 = null;
+  ap.tap.onaudioprocess = apOnAudio;
+  ap.tapSrc = micSrc;
+  return true;
+}
+function apWall(idx){ return ap.t0 + idx / SR * 1000; }
+function apGrab(sec){
+  var n = Math.min(Math.round(sec * SR), ap.ring.length, ap.total), out = new Float32Array(n), L = ap.ring.length;
+  var startIdx = ap.total - n, r = startIdx % L;
+  for (var i = 0; i < n; i++) { out[i] = ap.ring[r]; r++; if (r === L) r = 0; }
+  return { data: out, startIdx: startIdx };
+}
+function apWav16k(data, sr){
+  var rate = 16000, ratio = sr / rate, n = Math.floor(data.length / ratio), pcm = new Int16Array(n);
+  for (var i = 0; i < n; i++) {
+    var a = Math.floor(i * ratio), b = Math.min(data.length, Math.floor((i + 1) * ratio)), s = 0;
+    for (var j = a; j < b; j++) s += data[j];
+    var v = Math.max(-1, Math.min(1, s / Math.max(1, b - a)));
+    pcm[i] = v < 0 ? v * 0x8000 : v * 0x7fff;
+  }
+  var buf = new ArrayBuffer(44 + pcm.length * 2), dv = new DataView(buf);
+  function str(o, t){ for (var k = 0; k < t.length; k++) dv.setUint8(o + k, t.charCodeAt(k)); }
+  str(0, 'RIFF'); dv.setUint32(4, 36 + pcm.length * 2, true); str(8, 'WAVE');
+  str(12, 'fmt '); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+  dv.setUint32(24, rate, true); dv.setUint32(28, rate * 2, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+  str(36, 'data'); dv.setUint32(40, pcm.length * 2, true);
+  new Int16Array(buf, 44).set(pcm);
+  return new Blob([buf], { type: 'audio/wav' });
+}
+async function apBandFeatures(data, sr){
+  var out = [], hop = Math.round(sr * AP_HOP);
+  for (var bi = 0; bi < AP_BANDS.length; bi++) {
+    var b = AP_BANDS[bi];
+    var off = new OfflineAudioContext(1, data.length, sr), buf = off.createBuffer(1, data.length, sr);
+    buf.getChannelData(0).set(data);
+    var s = off.createBufferSource(); s.buffer = buf;
+    var f = off.createBiquadFilter(); f.type = b.type; f.frequency.value = b.f; if (b.q) f.Q.value = b.q;
+    s.connect(f); f.connect(off.destination); s.start(0);
+    var x = (await off.startRendering()).getChannelData(0);
+    var nF = Math.floor(x.length / hop), env = new Float32Array(nF), on = new Float32Array(nF), i, j;
+    for (i = 0; i < nF; i++) { var sum = 0; for (j = i * hop; j < (i + 1) * hop; j++) sum += x[j] * x[j]; env[i] = Math.log(1e-7 + Math.sqrt(sum / hop)); }
+    for (i = 1; i < nF; i++) on[i] = Math.max(0, env[i] - env[i - 1]);
+    var mean = 0; for (i = 0; i < nF; i++) mean += on[i]; mean /= Math.max(1, nF);
+    var v = 0; for (i = 0; i < nF; i++) v += (on[i] - mean) * (on[i] - mean);
+    var sd = Math.sqrt(v / Math.max(1, nF)) || 1;
+    for (i = 0; i < nF; i++) on[i] = (on[i] - mean) / sd;
+    out.push({ name: b.name, env: env, on: on });
+  }
+  return out;
+}
+function apXcorr(mic, ref){
+  var M = mic[0].on.length, N = ref[0].on.length, minOv = Math.floor(M * 0.6);
+  var kMin = -(M - minOv), kMax = N - minOv, len = kMax - kMin + 1, c = new Float32Array(len), k, i;
+  for (k = kMin; k <= kMax; k++) {
+    var i0 = Math.max(0, -k), i1 = Math.min(M, N - k), s = 0;
+    for (var b = 0; b < mic.length; b++) { var a = mic[b].on, r = ref[b].on; for (i = i0; i < i1; i++) s += a[i] * r[i + k]; }
+    c[k - kMin] = s / Math.max(1, (i1 - i0) * mic.length);
+  }
+  var sorted = Array.from(c).sort(function(x, y){ return x - y; }), med = sorted[Math.floor(len / 2)];
+  var dev = sorted.map(function(x){ return Math.abs(x - med); }).sort(function(x, y){ return x - y; });
+  var mad = dev[Math.floor(len / 2)] * 1.4826 + 1e-9, peaks = [];
+  for (i = 1; i < len - 1; i++) {
+    if (c[i] > c[i - 1] && c[i] >= c[i + 1]) {
+      var den = c[i - 1] - 2 * c[i] + c[i + 1], d = den !== 0 ? 0.5 * (c[i - 1] - c[i + 1]) / den : 0;
+      peaks.push({ k: i + kMin + d, z: (c[i] - med) / mad });
+    }
+  }
+  peaks.sort(function(p, q){ return q.z - p.z; });
+  var picked = [];
+  for (i = 0; i < peaks.length && picked.length < 5; i++) {
+    if (picked.every(function(q){ return Math.abs(q.k - peaks[i].k) >= 8; })) picked.push(peaks[i]);
+  }
+  return picked.map(function(p){ return { sec: +(p.k * AP_HOP).toFixed(4), z: +p.z.toFixed(2) }; });
+}
+function apCompactEnv(features){
+  var o = {};
+  features.forEach(function(f){
+    var e = f.env, lo = Infinity, hi = -Infinity, s = '', i;
+    for (i = 0; i < e.length; i++) { if (e[i] < lo) lo = e[i]; if (e[i] > hi) hi = e[i]; }
+    for (i = 0; i + 1 < e.length; i += 2) s += Math.max(0, Math.min(35, Math.round((((e[i] + e[i + 1]) / 2 - lo) / ((hi - lo) || 1)) * 35))).toString(36);
+    o[f.name] = s;
+  });
+  return o;
+}
+
+async function apIdentify(){
+  var prev = ap.state === 'warming' || ap.state === 'identify' ? 'waiting' : ap.state;
+  ap.state = 'identify'; apSay('listening to the room...');
+  var clip = apGrab(AP_ID_SEC), capturedAt = apWall(clip.startIdx), clipMs = Math.round(clip.data.length / SR * 1000);
+  var data = null;
+  try {
+    var form = new FormData();
+    form.append('audio', apWav16k(clip.data, SR), 'clip.wav');
+    form.append('capturedAt', String(Math.round(capturedAt)));
+    form.append('clipDurationMs', String(clipMs));
+    var res = await fetch(OL_BASE + '/api/recognize', { method: 'POST', body: form });
+    data = await res.json();
+  } catch (err) { data = { error: 'request failed' }; }
+  if (!data || data.error || typeof data.offsetSeconds !== 'number') {
+    ap.idGap = Math.min(120000, ap.idGap * 1.5);
+    ap.nextIdentifyAt = Date.now() + ap.idGap;
+    ap.state = prev;
+    apSay('no song recognized, listening again soon');
+    apLog({ kind: 'identify_miss', capturedAt: Math.round(capturedAt), clipMs: clipMs, error: data && data.error });
+    return;
+  }
+  ap.idGap = 30000;
+  var key = (data.title + '|' + data.artist).toLowerCase();
+  var clipEnd = capturedAt + clipMs;
+  apLog({ kind: 'identify', capturedAt: Math.round(capturedAt), clipMs: clipMs, auddTitle: data.title, auddArtist: data.artist,
+    auddOffset: data.offsetSeconds, auddTimecode: data.raw ? data.raw.timecode : null, videoId: data.videoId, bpm: data.bpm });
+  if (ap.song && ap.song.key === key) {
+    ap.song.auddPos = data.offsetSeconds; ap.song.auddAt = clipEnd;
+    ap.state = prev;
+    apAfterSongKnown();
+    return;
+  }
+  apStopRef();
+  ap.song = { key: key, title: data.title, artist: data.artist, auddPos: data.offsetSeconds, auddAt: clipEnd };
+  ap.ref = null; ap.locateMisses = 0;
+  apSay(data.title + ', fetching a reference copy...');
+  ap.ref = await apLoadRef(data.title, data.artist);
+  if (!ap.ref) {
+    ap.state = 'no_reference';
+    apSay(data.title + ', no reference copy available, waiting for the next song');
+    apLog({ kind: 'no_reference' });
+    ap.nextIdentifyAt = Date.now() + apRemainingMs(60000);
+    return;
+  }
+  apAfterSongKnown();
+}
+function apAfterSongKnown(){
+  if (ap.state === 'tracking') { ap.nextIdentifyAt = Date.now() + 120000; return; }
+  if (!ap.ref) { ap.nextIdentifyAt = Date.now() + apRemainingMs(60000); return; }
+  ap.state = 'locating'; ap.lastLocateAt = 0;
+  ap.nextIdentifyAt = Date.now() + 90000;
+}
+function apRemainingMs(fallback){
+  if (!ap.song || !ap.ref || !ap.ref.meta.trackMs) return fallback;
+  var pos = ap.song.auddPos + (Date.now() - ap.song.auddAt) / 1000;
+  var left = ap.ref.meta.trackMs / 1000 - pos;
+  return Math.max(20000, Math.min(400000, left * 1000 + 3000));
+}
+async function apLoadRef(title, artist){
+  try {
+    var res = await fetch(OL_BASE + '/api/preview?title=' + encodeURIComponent(title) + '&artist=' + encodeURIComponent(artist || ''));
+    if (!res.ok) return null;
+    var score = parseInt(res.headers.get('x-preview-score') || '0', 10);
+    var raw = await res.arrayBuffer();
+    if (score < 3) return null;
+    var blob = new Blob([raw], { type: res.headers.get('content-type') || 'audio/mp4' });
+    var audio = await ctx.decodeAudioData(raw.slice(0));
+    var ch = audio.getChannelData(0), mono = ch;
+    if (audio.numberOfChannels > 1) { var r = audio.getChannelData(1); mono = new Float32Array(ch.length); for (var i = 0; i < ch.length; i++) mono[i] = (ch[i] + r[i]) / 2; }
+    var features = await apBandFeatures(mono, audio.sampleRate);
+    return {
+      blob: blob, features: features, seconds: audio.duration,
+      meta: {
+        track: decodeURIComponent(res.headers.get('x-preview-track') || ''),
+        artist: decodeURIComponent(res.headers.get('x-preview-artist') || ''),
+        id: res.headers.get('x-preview-id') || '',
+        trackMs: parseInt(res.headers.get('x-preview-track-ms') || '0', 10) || null,
+        seconds: +audio.duration.toFixed(2), score: score
+      }
+    };
+  } catch (err) { return null; }
+}
+async function apLocate(){
+  ap.lastLocateAt = Date.now();
+  var clip = apGrab(AP_LOC_SEC), w0 = apWall(clip.startIdx);
+  var mic = await apBandFeatures(clip.data, SR);
+  var peaks = apXcorr(mic, ap.ref.features);
+  var best = peaks[0] && peaks[0].z >= AP_ZMIN ? peaks[0] : null;
+  var sample = { kind: 'locate', clipStart: Math.round(w0), preview: ap.ref.meta, peaks: peaks, micEnv: apCompactEnv(mic),
+    auddPosAtClip: ap.song ? +(ap.song.auddPos + (w0 - ap.song.auddAt) / 1000).toFixed(3) : null };
+  if (!best || best.sec < 0 || best.sec > ap.ref.seconds - 2) {
+    ap.locateMisses++;
+    sample.result = 'outside';
+    apLog(sample);
+    apSay(ap.song.title + ', waiting for the room to reach the reference section');
+    return;
+  }
+  var t = apTargetMs();
+  setOffset(t.ms);
+  if (fileURL) { try { URL.revokeObjectURL(fileURL); } catch (e) {} }
+  fileURL = URL.createObjectURL(ap.ref.blob); fileName = 'reference: ' + ap.ref.meta.track + ', ' + ap.ref.meta.artist;
+  var startAt = best.sec + (Date.now() - w0) / 1000 + t.ms / 1000 + 0.15;
+  attachFile(fileURL, fileName, startAt, true);
+  if (outGain) outGain.gain.setValueAtTime(ap.audible ? 1 : 0, ctx.currentTime);
+  resetSync(); updateSyncUI();
+  ap.state = 'tracking'; ap.lastCorrAt = Date.now(); ap.weakSince = 0;
+  sample.result = 'found'; sample.startAt = +startAt.toFixed(3);
+  sample.previewStartInSong = sample.auddPosAtClip !== null ? +(sample.auddPosAtClip - best.sec).toFixed(3) : null;
+  apLog(sample);
+  apSay(ap.song.title + ', reference found, tracking');
+}
+function apTrack(){
+  var now = Date.now();
+  if (!mediaEl || mediaEl.ended || (mediaEl.paused && now - ap.lastCorrAt > 3000)) {
+    apLog({ kind: 'reference_end', mediaTime: mediaEl ? +mediaEl.currentTime.toFixed(3) : null });
+    ap.state = 'waiting';
+    ap.nextIdentifyAt = now + apRemainingMs(30000);
+    apSay(ap.song ? ap.song.title + ', reference section over, waiting for the next song' : 'waiting');
+    return;
+  }
+  var good = sync.res !== null && sync.resR >= 0.3;
+  if (!good) { if (!ap.weakSince) ap.weakSince = now; }
+  else ap.weakSince = 0;
+  if (ap.weakSince && now - ap.weakSince > 20000) {
+    apLog({ kind: 'lost_lock', resR: +(sync.resR || 0).toFixed(3) });
+    ap.weakSince = 0;
+    ap.nextIdentifyAt = 0;
+  }
+  if (now - ap.lastLogAt > 5000) {
+    ap.lastLogAt = now;
+    apLog({ kind: 'track', mediaTime: +mediaEl.currentTime.toFixed(3), res: sync.res !== null ? +(sync.res * 1000).toFixed(2) : null,
+      resR: +(sync.resR || 0).toFixed(3), fine: sync.fine, natural: sync.natural !== null ? +(sync.natural * 1000).toFixed(2) : null,
+      bpm: beat.bpm ? +beat.bpm.toFixed(1) : null });
+  }
+  if (good && now - ap.lastCorrAt > 4000 && Math.abs(sync.res) > 0.003) {
+    var err = sync.res;
+    mediaEl.currentTime = Math.max(0, mediaEl.currentTime - err);
+    ap.lastCorrAt = now; ap.corrections++;
+    apLog({ kind: 'correct', errMs: +(err * 1000).toFixed(2), resR: +sync.resR.toFixed(3), fine: sync.fine, mediaTime: +mediaEl.currentTime.toFixed(3) });
+    resetSync();
+    apSay(ap.song.title + ', corrected ' + fmtMs(-err * 1000));
+  } else if (good && Math.abs(sync.res) <= 0.003) {
+    apSay(ap.song.title + ', locked ' + fmtMs(sync.res * 1000) + (sync.fine ? ', sample level' : ''));
+  }
+}
+function apStopRef(){
+  if (mediaEl && !mediaEl.paused) mediaEl.pause();
+}
+async function apRequestWake(){
+  if (!ap.on || !('wakeLock' in navigator)) return;
+  try { ap.wake = await navigator.wakeLock.request('screen'); } catch (e) {}
+}
+document.addEventListener('visibilitychange', function(){
+  if (document.visibilityState === 'visible' && ap.on) { apRequestWake(); if (ctx && ctx.state === 'suspended') ctx.resume(); }
+});
+function apStart(){
+  ensureCtx();
+  if (!micStream) toggleMic();
+  ap.on = true; ap.state = 'warming'; ap.nextIdentifyAt = 0; ap.song = null; ap.ref = null; ap.idGap = 30000;
+  $('#apToggleBtn').textContent = '●  Autopilot on'; $('#apToggleBtn').classList.add('on');
+  apSay('warming up the ear...');
+  apRequestWake();
+  apLog({ kind: 'autopilot_start' });
+}
+function apStop(){
+  ap.on = false; ap.state = 'off';
+  apStopRef();
+  if (ap.wake) { try { ap.wake.release(); } catch (e) {} ap.wake = null; }
+  $('#apToggleBtn').textContent = '●  Autopilot'; $('#apToggleBtn').classList.remove('on');
+  apSay('stopped');
+}
+$('#apToggleBtn').addEventListener('click', function(){ if (ap.on) apStop(); else apStart(); });
+$('#apAudibleBtn').addEventListener('click', function(){
+  ap.audible = !ap.audible; togglePressed(this, ap.audible);
+  this.textContent = ap.audible ? 'Reference audible' : 'Reference silent';
+  if (ap.on && outGain && ctx) outGain.gain.setValueAtTime(ap.audible ? 1 : 0, ctx.currentTime);
+});
+setInterval(async function(){
+  if (!ap.on || ap.busy) return;
+  if (!apEnsureTap() || ap.t0 === null) { apSay('waiting for the mic...'); return; }
+  if (ap.total < AP_ID_SEC * SR) { apSay('warming up the ear...'); return; }
+  ap.busy = true;
+  try {
+    var now = Date.now();
+    if (ap.state === 'tracking') { apTrack(); if (ap.nextIdentifyAt === 0) await apIdentify(); }
+    else if (ap.state === 'locating' && now - ap.lastLocateAt > 6000) {
+      if (now > ap.nextIdentifyAt) await apIdentify(); else await apLocate();
+    }
+    else if (now > ap.nextIdentifyAt) await apIdentify();
+  } catch (err) {
+    apLog({ kind: 'autopilot_error', error: String(err && err.message || err) });
+  } finally {
+    ap.busy = false; apStats();
+  }
+}, 1000);
+
 /* info buttons */
 var INFO={
   burger:'Opens the controls drawer with the delay trim, display sliders, and latency calibration.',
@@ -1296,7 +1647,9 @@ var INFO={
   ytplay:'Starts or pauses the video.',
   ytmatch:'Jumps the video to the same spot as the song on channel 1. Then let the offset settle and tap Align now to trim out what is left.',
   ytclose:'Stops the video and hides the player.',
-  sublat:'Removes the measured round trip from the offset readout so it shows only the difference between the two sources.'
+  sublat:'Removes the measured round trip from the offset readout so it shows only the difference between the two sources.',
+  autopilot:'Hands free mode. Listens to the room, identifies the song through Offset Listener, pulls a short reference copy of that track, finds where the room is inside it, starts it on channel 1 at that spot, and keeps moving it until the room and the reference line up at sample level. Every identify, locate, correction, and a status reading every few seconds are saved to Offset Listener for later study. Calibrate once first for the best target.',
+  apaudible:'Silent keeps the reference out of the speaker so the mic hears only the room, which is what the lock needs. Audible sends it to the output, meant for wired headphones so the speaker does not feed back into the mic.'
 };
 var pop=document.createElement('div'); pop.className='pop'; pop.setAttribute('role','tooltip'); pop.hidden=true; document.body.appendChild(pop);
 var popFor=null;
@@ -1346,7 +1699,7 @@ function addIB(sel,k,where,ownerSel){
   ['label[for="offset"]','trim','in'],['[data-nudge="10"]','nudge','after','#drawer .row'],
   ['label[for="tb"]','timebase','in'],['label[for="g1"]','gain1','in'],['label[for="g2"]','gain2','in'],['label[for="pers"]','glow','in'],
   ['#trigBtn','trigger'],['#levelBtn','level'],['#freezeBtn','freeze'],
-  ['#calBtn','calibrate'],['#calUseBtn','sublat'],['#olToggleBtn','olsync'],['#ytLoadBtn','yt'],['#ytPlay','ytplay'],['#ytMatch','ytmatch'],['#ytClose','ytclose']
+  ['#calBtn','calibrate'],['#calUseBtn','sublat'],['#olToggleBtn','olsync'],['#ytLoadBtn','yt'],['#ytPlay','ytplay'],['#ytMatch','ytmatch'],['#ytClose','ytclose'],['#apToggleBtn','autopilot'],['#apAudibleBtn','apaudible']
 ].forEach(function(m){ addIB(m[0],m[1],m[2],m[3]); });
 document.addEventListener('click',function(e){ if(popFor&&!pop.contains(e.target)) closePop(); });
 document.addEventListener('scroll',closePop,true);
